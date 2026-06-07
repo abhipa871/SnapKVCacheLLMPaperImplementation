@@ -9,6 +9,9 @@ SnapKV scores attention during prefill, keeps high-importance prefix tokens plus
 - [`modify_qwen.py`](modify_qwen.py) — `SnapKVCache`, `SnapKVQwen3_5Attention` / `SnapKVQwen3_5ForCausalLM`, mask helpers (`build_snapkv_kv_valid_mask`, `make_snapkv_causal_mask`, `left_pad_logical_positions`, `prefill_prompt_complete`), and HF `prefill_chunk_size` wiring via `_prefill`.
 - [`test_modify_qwen_snapkv.py`](test_modify_qwen_snapkv.py) — SnapKV test suite (padding, gate, cache unit, masks, chunked prefill, HF-style prefix masks, optional CUDA).
 - [`pytest.ini`](pytest.ini) — markers: `gpu`, `padding`, `snapkv`, `chunk_prefill`, `integration`.
+- [`snapkv_longbench_qwen35_colab.ipynb`](snapkv_longbench_qwen35_colab.ipynb) — LongBench baseline vs SnapKV eval on `Qwen/Qwen3.5-0.8B`.
+- [`longbench_config/`](longbench_config/) — vendored SnapKV LongBench prompt/maxlen JSON.
+- [`longbench_metrics.py`](longbench_metrics.py) — vendored LongBench task metrics and `scorer()`.
 - [`h2o_gsm8k_eval_colab.ipynb`](h2o_gsm8k_eval_colab.ipynb) — legacy GSM8K accuracy notebook (H2O naming; predates SnapKV rename).
 
 ## Requirements
@@ -113,6 +116,21 @@ gen_cfg = GenerationConfig(
 )
 model.generate(**batch, generation_config=gen_cfg, use_cache=True)
 ```
+
+## LongBench evaluation
+
+[`snapkv_longbench_qwen35_colab.ipynb`](snapkv_longbench_qwen35_colab.ipynb) reproduces the minimal SnapKV [LongBench](https://arxiv.org/abs/2308.14508) pipeline from [pred_snap.py](https://github.com/FasterDecoding/SnapKV/blob/main/experiments/LongBench/pred_snap.py), using `SnapKVQwen3_5ForCausalLM` on `Qwen/Qwen3.5-0.8B`.
+
+1. Open the notebook on a GPU runtime (Colab or local).
+2. Ensure the repo root (with `modify_qwen.py`) is on `PYTHONPATH`.
+3. For a quick smoke test, set `SMOKE_TEST = True` (2 samples, `qasper` only).
+4. Default run: baseline Full-KV vs SnapKV (`max_capacity_prompt=2048`, `window_size=32`) on `qasper`, `hotpotqa`, `narrativeqa`.
+
+Artifacts:
+
+- `pred/{run_name}/{dataset}.jsonl` — raw predictions
+- `results/{run_name}/result.json` — per-task scores (0–100)
+- `results/comparison.csv` — baseline vs SnapKV table
 
 ## Tests
 
