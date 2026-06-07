@@ -1,18 +1,19 @@
-# H2O-style KV cache (Qwen3.5)
+# SnapKV KV cache (Qwen3.5)
 
-This repo implements **H2O-style KV cache eviction** inside Hugging Face **dense Qwen3.5** models: `H2OKVCache` plus `H2OQwen3_5ForCausalLM` in [`modify_qwen.py`](modify_qwen.py). It is **not** a generic drop-in for other architectures.
+This repo implements **SnapKV** prompt KV compression inside Hugging Face **dense Qwen3.5** models: `SnapKVCache` plus `SnapKVQwen3_5ForCausalLM` in [`modify_qwen.py`](modify_qwen.py). It is **not** a generic drop-in for other architectures.
 
-The idea follows the H2O heavy-hitter + recent-window cache policy for long-context LLM inference; this code paths it through Qwen3.5’s attention stack and `DynamicCache`.
+SnapKV scores attention during prefill, keeps high-importance prefix tokens plus a recent window, and tracks logical positions for left-padded batched generation. The policy follows the SnapKV paper; this code paths it through Qwen3.5’s attention stack and `DynamicCache`.
 
 ## Layout
 
-- [`modify_qwen.py`](modify_qwen.py) — `H2OKVCache`, `H2OQwen3_5Attention` / `H2OQwen3_5ForCausalLM`, and mask helpers (`build_h2o_kv_valid_mask`, `make_h2o_causal_mask`).
-- [`test_modify_qwen_snapkv.py`](test_modify_qwen_snapkv.py) — CPU coverage (padding, SnapKV, chunked prefill) plus optional CUDA tests.
-- [`h2o_gsm8k_eval_colab.ipynb`](h2o_gsm8k_eval_colab.ipynb) — GSM8K accuracy vs KV **budget %** (Local / Full / H2O sweeps; Colab-oriented).
+- [`modify_qwen.py`](modify_qwen.py) — `SnapKVCache`, `SnapKVQwen3_5Attention` / `SnapKVQwen3_5ForCausalLM`, mask helpers (`build_snapkv_kv_valid_mask`, `make_snapkv_causal_mask`, `left_pad_logical_positions`, `prefill_prompt_complete`), and HF `prefill_chunk_size` wiring via `_prefill`.
+- [`test_modify_qwen_snapkv.py`](test_modify_qwen_snapkv.py) — SnapKV test suite (padding, gate, cache unit, masks, chunked prefill, HF-style prefix masks, optional CUDA).
+- [`pytest.ini`](pytest.ini) — markers: `gpu`, `padding`, `snapkv`, `chunk_prefill`, `integration`.
+- [`h2o_gsm8k_eval_colab.ipynb`](h2o_gsm8k_eval_colab.ipynb) — legacy GSM8K accuracy notebook (H2O naming; predates SnapKV rename).
 
 ## Requirements
 
-- Python 3, **PyTorch**, **Transformers** (notebook uses `transformers>=4.53.0`; use a matching or newer version locally).
+- Python 3, **PyTorch**, **Transformers** (tested with 5.6.x; use a matching or newer version locally).
 - **CUDA** optional; GPU-only tests are marked `gpu`.
 - For tests: `pytest`.
 
@@ -20,42 +21,37 @@ The idea follows the H2O heavy-hitter + recent-window cache policy for long-cont
 pip install -U "transformers>=4.53.0" torch datasets accelerate matplotlib pandas tqdm pytest
 ```
 
-## Using `H2OQwen3_5ForCausalLM` in Python
+## Using `SnapKVQwen3_5ForCausalLM` in Python
 
-`modify_qwen.py` reads **`hh_size`** and **`recent_size`** from the model config (via each attention layer’s `H2OKVCache`). Effective cap is **`hh_size + recent_size`** tokens in the H2O cache.
+`modify_qwen.py` reads **`window_size`** and **`max_capacity_prompt`** from the model config (via each attention layer’s `SnapKVCache`). After prefill, the compressed prompt cache holds at most **`max_capacity_prompt`** KV slots (top-scored prefix + trailing **`window_size`** recent tokens).
 
-Set those fields on **both** the top-level `config` and **`config.text_config`** when it exists (same pattern as `_patch_kv_budget` in the tests). For **recent-only “Local”** style behavior (no heavy hitters), use **`hh_size=0`** and set **`recent_size`** to your recent window in tokens.
+Set those fields on **both** the top-level `config` and **`config.text_config`** when it exists (same pattern as `_patch_snapkv_budget` in the tests).
 
-Use **`attn_implementation="eager"`** with this stack. For **batched** generation, set **`tokenizer.padding_side = "left"`** (see `H2OKVCache` docstring). Call **`model.reset_h2o_state()`** when you want to clear H2O score/position bookkeeping between unrelated sequences (after `generate` in the tests).
+Use **`attn_implementation="eager"`** with this stack. For **batched** generation, set **`tokenizer.padding_side = "left"`** (see `SnapKVCache` docstring). Call **`model.reset_snapkv_state()`** when starting a new unrelated sequence (also done automatically in `prepare_inputs_for_generation` when the cache is empty).
 
 ```python
 import copy
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from modify_qwen import H2OQwen3_5ForCausalLM
+from modify_qwen import SnapKVQwen3_5ForCausalLM
 
 
-def patch_h2o_budget(cfg, hh_size: int, recent_size: int):
-    """Mirror test_modify_qwen_h2o._patch_kv_budget: set on root + text_config."""
+def patch_snapkv_budget(cfg, max_capacity_prompt: int, window_size: int):
+    """Mirror test_modify_qwen_snapkv._patch_snapkv_budget: set on root + text_config."""
     c = copy.deepcopy(cfg)
     for obj in (c, getattr(c, "text_config", None)):
         if obj is None:
             continue
-        setattr(obj, "hh_size", hh_size)
-        setattr(obj, "recent_size", recent_size)
-        # Absolute (integer budget) runs: leave ratio bookkeeping unset unless you rely on notebook helpers below.
-        for k in ("hh_ratio", "h2o_full_cache_size"):
-            if hasattr(obj, k):
-                setattr(obj, k, None)
+        setattr(obj, "max_capacity_prompt", max_capacity_prompt)
+        setattr(obj, "window_size", window_size)
     return c
 
 
 MODEL_ID = "Qwen/Qwen3.5-0.8B"
 
 base_cfg = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
-# Example budgets: hh “heavy hitter” slots + trailing “recent” window (tokens).
-cfg = patch_h2o_budget(base_cfg, hh_size=8, recent_size=8)
+cfg = patch_snapkv_budget(base_cfg, max_capacity_prompt=512, window_size=64)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 tokenizer.padding_side = "left"
@@ -66,7 +62,7 @@ if torch.cuda.is_available():
     device_kw["device_map"] = "cuda:0"
 
 model = (
-    H2OQwen3_5ForCausalLM.from_pretrained(
+    SnapKVQwen3_5ForCausalLM.from_pretrained(
         MODEL_ID,
         config=cfg,
         torch_dtype=dtype,
@@ -92,41 +88,69 @@ with torch.inference_mode():
     )
 
 print(tokenizer.decode(ids[0], skip_special_tokens=True))
-model.reset_h2o_state()
 ```
 
-### Ratio-style settings in the GSM8K notebook
+### Chunked prefill
 
-The Colab notebook also defines **`load_h2o_model_ratio` / `load_h2o_model_absolute`**. **`load_h2o_model_absolute`** matches the integer `hh_size` / `recent_size` knobs above after clearing optional ratio metadata. **`load_h2o_model_ratio`** plus **`budget_to_kv_settings`** encode how Full/H2O curves share the KV budget in that experiment pipeline. If you copy logic into your own scripts, ensure the **integer** `hh_size` / `recent_size` reflect the budgets you intend (same pattern as **`patch_h2o_budget`** here).
+SnapKV runs **once** after prefill completes, not on intermediate chunks.
 
-## GSM8K notebook (Colab / local)
+| Path | How final chunk is detected |
+|------|-----------------------------|
+| **One-shot / manual full-mask** | `prefill_prompt_complete(attention_mask, past_len, chunk_len)` when both flags are false |
+| **HF `prefill_chunk_size`** | `SnapKVQwen3_5ForCausalLM._prefill` sets `hf_chunked_prefill=True` every chunk and `prefill_final_chunk=True` only on the last chunk |
 
-1. Use a **GPU** runtime if possible.
-2. Run the install cell, e.g.  
-   `pip install -U "transformers>=4.53.0" datasets accelerate matplotlib pandas tqdm`
-3. Make [`modify_qwen.py`](modify_qwen.py) importable (repository root on `PYTHONPATH`, or upload next to the notebook in Colab as in its instructions).
-4. Run setup + evaluation sections in order.
+For HF chunked prefill, each forward receives a **prefix-sliced** attention mask (`attention_mask[:, :current_end]`), not the full prompt width. Do not infer prefill completion from `attention_mask.sum()` on those chunks.
 
-Typical artifacts: **`results.csv`**, **`predictions.csv`**, **`results.json`**, **`accuracy_vs_budget.png`**.
+Manual chunked prefill (tests) passes the **full** mask every chunk and relies on `prefill_prompt_complete`.
+
+```python
+from transformers import GenerationConfig
+
+gen_cfg = GenerationConfig(
+    max_new_tokens=32,
+    do_sample=False,
+    prefill_chunk_size=128,  # HF wires hf_chunked_prefill / prefill_final_chunk via _prefill
+)
+model.generate(**batch, generation_config=gen_cfg, use_cache=True)
+```
 
 ## Tests
 
 From the repo root:
 
 ```bash
-# CPU-centric tests
-python -m pytest test_modify_qwen_snapkv.py -m "not gpu"
+# All CPU tests (37 tests)
+python -m pytest test_modify_qwen_snapkv.py -m "not gpu" -q
 
 # CUDA smoke tests (needs a GPU)
-python -m pytest test_modify_qwen_snapkv.py -m gpu
+python -m pytest test_modify_qwen_snapkv.py -m gpu -q
+```
+
+### Test sections (`test_modify_qwen_snapkv.py`)
+
+| Marker | Coverage |
+|--------|----------|
+| `padding` | `left_pad_logical_positions`, `dense_kv_logical_positions`, `build_snapkv_kv_valid_mask`, causal masks |
+| `chunk_prefill` | `prefill_prompt_complete` gate, manual chunked prefill, HF prefix-sliced masks, `prepare_inputs_for_generation` flags |
+| `snapkv` | `SnapKVCache` lifecycle, compression, position tracking, attention mask paths |
+| `integration` | Mini-model multi-forward prefill and left-pad eviction |
+| `gpu` | `Qwen/Qwen3.5-0.8B` generate, long prefill, padded decode, dynamic cache |
+
+Filter examples:
+
+```bash
+python -m pytest test_modify_qwen_snapkv.py -m chunk_prefill -q
+python -m pytest test_modify_qwen_snapkv.py -m "snapkv and not gpu" -q
 ```
 
 ## Troubleshooting
 
-- **`unexpected keyword argument 'padding_attention_mask'`** — Qwen decoder layer forward must thread custom kwargs through to `self_attn` (notebook “Sanity checks” cell expands on this).
-- **KV length / `position_ids` mismatches** — compare `kv_cache.position_ids` to `key_states.shape[2]` and the logic in `_build_additive_attention_mask` in [`modify_qwen.py`](modify_qwen.py).
-- **Heavy-hitter masking** — very small valid regions vs **`hh_size`** can make top-k behavior noisy; warnings may come from `_mask_hh_scores_with_valid_positions`.
+- **`unexpected keyword argument 'padding_attention_mask'`** — Qwen decoder layers must thread `padding_attention_mask` through to `self_attn` (see notebook sanity checks if using the Colab eval).
+- **SnapKV runs too early on HF chunked prefill** — ensure `hf_chunked_prefill` / `prefill_final_chunk` are set by `_prefill` (or pass them explicitly when calling the text model directly). A prefix mask whose width equals the chunk length is **not** a complete prompt.
+- **KV length / `position_ids` mismatches** — compare `snap_kv_cache.position_ids` to `key_states.shape[2]` and `_build_additive_attention_mask` in [`modify_qwen.py`](modify_qwen.py).
+- **Left-pad batches** — invalid padding slots must not receive valid SnapKV scores; see `build_snapkv_kv_valid_mask` and GPU `test_gpu_greedy_padded_decode_position_ids_stable`.
+- **Heterogeneous manual chunked prefill** — batch-level `.all()` gating defers SnapKV until the longest row finishes; rectangular chunks may include pad columns for shorter rows (see test docstrings).
 
 ## Reference
 
-Implements eviction behavior in the spirit of **H2O** (heavy-hitter + recent KV retention) for efficient long-context inference; see the H2O paper for the original policy.
+Implements compression behavior in the spirit of **SnapKV** (observation-window scoring + prefix top-k retention) for efficient long-context inference.

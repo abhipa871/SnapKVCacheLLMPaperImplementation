@@ -902,14 +902,7 @@ class SnapKVQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
         """
         Perform the prefill stage of generation.
 
-        Note that usually, the prefill stage is always the first iteration of a new input batch, and thus multimodal inputs etc
-        should be treated as if it's the first iteration. However, for assisted decoding, assistants call `generate`
-        several time in a row for a same batch of inputs, so we need to pass `is_first_iteration` here for such cases.
         """
-        # When restarting from previous cache, the `input_ids` are either the FULL sequence, including previous inputs,
-        # or only the new tokens but in this case the attention_mask still contains the FULL sequence (because otherwise we may
-        # lose some early padding tokens information). So slice inputs according to that if needed
-        # When restarting from `inputs_embeds`, it's always the FULL sequence, and we always need to slice
         next_sequence_length = None
         inputs_embeds = model_kwargs.get("inputs_embeds")
         use_inputs_embeds = False
