@@ -124,13 +124,13 @@ model.generate(**batch, generation_config=gen_cfg, use_cache=True)
 1. Open the notebook on a GPU runtime (Colab or local).
 2. Ensure the repo root (with `modify_qwen.py`) is on `PYTHONPATH`.
 3. For a quick smoke test, set `SMOKE_TEST = True` (2 samples, `qasper` only).
-4. Default run: baseline Full-KV vs SnapKV (`max_capacity_prompt=2048`, `window_size=32`) on `qasper`, `hotpotqa`, `narrativeqa`.
+4. Default run: baseline Full-KV vs SnapKV at `max_capacity_prompt` ∈ {1024, 2048, 4096} (`window_size=32`, `kernel_size=7`, `maxpool`) on `qasper`, `hotpotqa`, `multifieldqa_en`.
 
 Artifacts:
 
 - `pred/{run_name}/{dataset}.jsonl` — raw predictions
 - `results/{run_name}/result.json` — per-task scores (0–100)
-- `results/comparison.csv` — baseline vs SnapKV table
+- `results/comparison.csv` — baseline vs SnapKV c1024/c2048/c4096 table
 
 ## Tests
 
