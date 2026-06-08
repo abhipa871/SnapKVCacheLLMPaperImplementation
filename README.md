@@ -6,9 +6,9 @@ SnapKV scores attention during prefill, keeps high-importance prefix tokens plus
 
 ## Layout
 
-- [`modify_qwen.py`](modify_qwen.py) — `SnapKVCache`, `SnapKVQwen3_5Attention` / `SnapKVQwen3_5ForCausalLM`, mask helpers (`build_snapkv_kv_valid_mask`, `make_snapkv_causal_mask`, `left_pad_logical_positions`, `prefill_prompt_complete`), and HF `prefill_chunk_size` wiring via `_prefill`.
-- [`test_modify_qwen_snapkv.py`](test_modify_qwen_snapkv.py) — SnapKV test suite (padding, gate, cache unit, masks, chunked prefill, HF-style prefix masks, optional CUDA).
-- [`pytest.ini`](pytest.ini) — markers: `gpu`, `padding`, `snapkv`, `chunk_prefill`, `integration`.
+- [`modify_qwen.py`](modify_qwen.py) — `SnapKVCache`, `SnapKVQwen3_5Attention` / `SnapKVQwen3_5ForCausalLM`, mask helpers (`build_snapkv_kv_valid_mask`, `make_snapkv_causal_mask`, `left_pad_logical_positions`).
+- [`test_modify_qwen_snapkv.py`](test_modify_qwen_snapkv.py) — SnapKV test suite (padding, cache unit, masks, one-shot prefill integration, optional CUDA).
+- [`pytest.ini`](pytest.ini) — markers: `gpu`, `padding`, `snapkv`, `integration`.
 - [`snapkv_longbench_qwen35_colab.ipynb`](snapkv_longbench_qwen35_colab.ipynb) — LongBench baseline vs SnapKV eval on `Qwen/Qwen3.5-0.8B`.
 - [`longbench_config/`](longbench_config/) — vendored SnapKV LongBench prompt/maxlen JSON.
 - [`longbench_metrics.py`](longbench_metrics.py) — vendored LongBench task metrics and `scorer()`.
@@ -93,29 +93,9 @@ with torch.inference_mode():
 print(tokenizer.decode(ids[0], skip_special_tokens=True))
 ```
 
-### Chunked prefill
+### Prefill assumption
 
-SnapKV runs **once** after prefill completes, not on intermediate chunks.
-
-| Path | How final chunk is detected |
-|------|-----------------------------|
-| **One-shot / manual full-mask** | `prefill_prompt_complete(attention_mask, past_len, chunk_len)` when both flags are false |
-| **HF `prefill_chunk_size`** | `SnapKVQwen3_5ForCausalLM._prefill` sets `hf_chunked_prefill=True` every chunk and `prefill_final_chunk=True` only on the last chunk |
-
-For HF chunked prefill, each forward receives a **prefix-sliced** attention mask (`attention_mask[:, :current_end]`), not the full prompt width. Do not infer prefill completion from `attention_mask.sum()` on those chunks.
-
-Manual chunked prefill (tests) passes the **full** mask every chunk and relies on `prefill_prompt_complete`.
-
-```python
-from transformers import GenerationConfig
-
-gen_cfg = GenerationConfig(
-    max_new_tokens=32,
-    do_sample=False,
-    prefill_chunk_size=128,  # HF wires hf_chunked_prefill / prefill_final_chunk via _prefill
-)
-model.generate(**batch, generation_config=gen_cfg, use_cache=True)
-```
+The full prompt is processed in **one** prefill forward (`past_key_values.get_seq_length() == 0` at the start of that forward). SnapKV scoring and compression run on that pass only. Multi-chunk / `prefill_chunk_size` prefill is not supported by this port.
 
 ## LongBench evaluation
 
@@ -137,7 +117,7 @@ Artifacts:
 From the repo root:
 
 ```bash
-# All CPU tests (37 tests)
+# All CPU tests
 python -m pytest test_modify_qwen_snapkv.py -m "not gpu" -q
 
 # CUDA smoke tests (needs a GPU)
@@ -148,26 +128,23 @@ python -m pytest test_modify_qwen_snapkv.py -m gpu -q
 
 | Marker | Coverage |
 |--------|----------|
-| `padding` | `left_pad_logical_positions`, `dense_kv_logical_positions`, `build_snapkv_kv_valid_mask`, causal masks |
-| `chunk_prefill` | `prefill_prompt_complete` gate, manual chunked prefill, HF prefix-sliced masks, `prepare_inputs_for_generation` flags |
+| `padding` | `left_pad_logical_positions`, `build_snapkv_kv_valid_mask`, causal masks |
 | `snapkv` | `SnapKVCache` lifecycle, compression, position tracking, attention mask paths |
-| `integration` | Mini-model multi-forward prefill and left-pad eviction |
+| `integration` | Mini-model one-shot prefill and left-pad eviction |
 | `gpu` | `Qwen/Qwen3.5-0.8B` generate, long prefill, padded decode, dynamic cache |
 
 Filter examples:
 
 ```bash
-python -m pytest test_modify_qwen_snapkv.py -m chunk_prefill -q
 python -m pytest test_modify_qwen_snapkv.py -m "snapkv and not gpu" -q
 ```
 
 ## Troubleshooting
 
 - **`unexpected keyword argument 'padding_attention_mask'`** — Qwen decoder layers must thread `padding_attention_mask` through to `self_attn` (see notebook sanity checks if using the Colab eval).
-- **SnapKV runs too early on HF chunked prefill** — ensure `hf_chunked_prefill` / `prefill_final_chunk` are set by `_prefill` (or pass them explicitly when calling the text model directly). A prefix mask whose width equals the chunk length is **not** a complete prompt.
 - **KV length / `position_ids` mismatches** — compare `snap_kv_cache.position_ids` to `key_states.shape[2]` and `_build_additive_attention_mask` in [`modify_qwen.py`](modify_qwen.py).
 - **Left-pad batches** — invalid padding slots must not receive valid SnapKV scores; see `build_snapkv_kv_valid_mask` and GPU `test_gpu_greedy_padded_decode_position_ids_stable`.
-- **Heterogeneous manual chunked prefill** — batch-level `.all()` gating defers SnapKV until the longest row finishes; rectangular chunks may include pad columns for shorter rows (see test docstrings).
+- **OOM on long prompts** — process the full prompt in one forward; use a smaller `max_capacity_prompt` SnapKV budget or cap input length (see LongBench notebook notes).
 
 ## Reference
 

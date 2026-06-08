@@ -4,7 +4,6 @@ from collections.abc import Callable
 from torch import nn
 
 from transformers.cache_utils import Cache, DynamicCache, DynamicLayer
-from transformers.generation.configuration_utils import GenerationConfig
 from transformers.integrations import use_kernelized_func
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -40,7 +39,6 @@ __all__ = [
     "build_snapkv_kv_valid_mask",
     "left_pad_logical_positions",
     "make_snapkv_causal_mask",
-    "prefill_prompt_complete",
 ]
 
 class SnapKVCache:
@@ -113,26 +111,10 @@ class SnapKVCache:
                 pos = text_position_ids.to(device=device, dtype=dtype)
                 if pos.ndim == 3:
                     pos = pos[0]
-                if pos.shape[-1] == kv_len:
-                    pass
-                elif pos.shape[-1] == q_len and q_len < kv_len:
-                    pos = dense_kv_logical_positions(
-                        kv_len, q_len, pos, device=device, dtype=dtype
-                    )
-                elif (
-                    padding_attention_mask is not None
-                    and padding_attention_mask.shape[-1] > kv_len
-                ):
-                    pos = torch.arange(kv_len, device=device, dtype=dtype).view(1, -1).expand(bsz, -1)
-                else:
+                if pos.shape[-1] != kv_len:
                     raise ValueError(
                         f"SnapKV initial text_position_ids length {pos.shape[-1]} != kv_len {kv_len}"
                     )
-            elif (
-                padding_attention_mask is not None
-                and padding_attention_mask.shape[-1] > kv_len
-            ):
-                pos = torch.arange(kv_len, device=device, dtype=dtype).view(1, -1).expand(bsz, -1)
             else:
                 pos = torch.arange(kv_len, device=device, dtype=dtype).view(1, -1).expand(bsz, -1)
 
@@ -640,8 +622,6 @@ class SnapKVQwen3_5TextModel(Qwen3_5PreTrainedModel):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
-        prefill_final_chunk: bool = False,
-        hf_chunked_prefill: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -668,26 +648,12 @@ class SnapKVQwen3_5TextModel(Qwen3_5PreTrainedModel):
                     else 0
                 )
 
-            mask_aware_positions = (
+            if (
                 attention_mask is not None
                 and seq_len == attention_mask.shape[-1]
-            )
-
-            if hf_chunked_prefill and attention_mask is not None:
-                # HF prefill_chunk_size path: attention_mask is prefix-sliced from the
-                # prompt start through the current chunk. Build logical positions over
-                # the whole prefix; the current chunk gets the last seq_len positions.
-                # Do NOT add past_seen_tokens: the prefix already starts at token 0.
-                full_prefix_pos = left_pad_logical_positions(
-                    attention_mask.to(device=device)
-                )
-                text_pos = full_prefix_pos[:, -seq_len:]
-                position_ids = text_pos.unsqueeze(0).expand(4, batch, -1)
-
-            elif mask_aware_positions:
+            ):
                 text_pos = left_pad_logical_positions(
-                    attention_mask.to(device=device),
-                    past_seen_tokens,
+                    attention_mask.to(device=device)
                 )
                 position_ids = text_pos.unsqueeze(0).expand(4, batch, -1)
 
@@ -718,16 +684,6 @@ class SnapKVQwen3_5TextModel(Qwen3_5PreTrainedModel):
                 position_ids = step + past_seen_tokens
                 position_ids = position_ids.view(1, 1, -1).expand(4, batch, -1)
 
-        elif hf_chunked_prefill and position_ids is not None and attention_mask is not None:
-            batch = inputs_embeds.shape[0]
-            seq_len = inputs_embeds.shape[1]
-            device = inputs_embeds.device
-            full_prefix_pos = left_pad_logical_positions(
-                attention_mask.to(device=device)
-            )
-            text_pos = full_prefix_pos[:, -seq_len:]
-            position_ids = text_pos.unsqueeze(0).expand(4, batch, -1)
-
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
@@ -754,8 +710,6 @@ class SnapKVQwen3_5TextModel(Qwen3_5PreTrainedModel):
             if past_key_values is not None
             else 0
         )
-        chunk_seq_len = inputs_embeds.shape[1]
-
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if self.config.layer_types[i] == "linear_attention":
                 layer_mask = linear_attn_mask
@@ -768,22 +722,10 @@ class SnapKVQwen3_5TextModel(Qwen3_5PreTrainedModel):
                 and past_key_values is not None
                 and attention_mask is not None
                 and not getattr(past_key_values, "last_chunk_processed", False)
+                and prefill_len_before_forward == 0
             ):
-                if prefill_final_chunk:
-                    should_mark_last_chunk = True
-                elif hf_chunked_prefill:
-                    # HF prefill_chunk_size path: the prefix-sliced mask cannot reveal
-                    # the full prompt length, so never infer finality from its sum.
-                    should_mark_last_chunk = False
-                else:
-                    # Manual full-mask chunked-prefill / one-shot path.
-                    should_mark_last_chunk = prefill_prompt_complete(
-                        attention_mask, prefill_len_before_forward, chunk_seq_len
-                    )
-
-                if should_mark_last_chunk:
-                    past_key_values.last_chunk_processed = True
-                    decoder_kwargs["last_chunk_processed"] = True
+                past_key_values.last_chunk_processed = True
+                decoder_kwargs["last_chunk_processed"] = True
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -876,8 +818,6 @@ class SnapKVQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
 
     def prepare_inputs_for_generation(self, *args, **kwargs):
         past_key_values = kwargs.get("past_key_values", None)
-        prefill_final_chunk = kwargs.pop("prefill_final_chunk", False)
-        hf_chunked_prefill = kwargs.pop("hf_chunked_prefill", False)
 
         is_new_sequence = past_key_values is None or (
             hasattr(past_key_values, "get_seq_length")
@@ -886,100 +826,11 @@ class SnapKVQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
         if is_new_sequence:
             self.reset_snapkv_state()
 
-        model_inputs = super().prepare_inputs_for_generation(*args, **kwargs)
-        model_inputs["prefill_final_chunk"] = prefill_final_chunk
-        model_inputs["hf_chunked_prefill"] = hf_chunked_prefill
-        return model_inputs
-
-    # Copied from GenerationMixin._prefill (transformers 5.6.2) with SnapKV flag wiring.
-    def _prefill(
-        self,
-        input_ids: torch.LongTensor,
-        generation_config: GenerationConfig,
-        model_kwargs: dict,
-        is_first_iteration: bool = True,
-    ):
-        """
-        Perform the prefill stage of generation.
-
-        """
-        next_sequence_length = None
-        inputs_embeds = model_kwargs.get("inputs_embeds")
-        use_inputs_embeds = False
-        if not self.config.is_encoder_decoder and inputs_embeds is not None and is_first_iteration:
-            use_inputs_embeds = True
-        if (cache := model_kwargs.get("past_key_values")) is not None:
-            past_length = cache.get_seq_length()
-            # It will be sliced as input_embeds = inputs_embeds[:, -next_sequence_length:, :] in `prepare_inputs_for_generation`
-            if use_inputs_embeds:
-                next_sequence_length = model_kwargs["inputs_embeds"].shape[1] - past_length
-            else:
-                attention_mask_key = "decoder_attention_mask" if self.config.is_encoder_decoder else "attention_mask"
-                attention_mask = model_kwargs.get(attention_mask_key)
-                # In this case we need to slice - if it's smaller than the mask, only the new inputs were passed -> no need to do anything
-                if attention_mask is not None and input_ids.shape[1] == attention_mask.shape[1]:
-                    # inputs will be sliced as `input_ids[:, -next_sequence_length :]` in `prepare_inputs_for_generation`
-                    next_sequence_length = input_ids.shape[1] - past_length
-
-        # Usual prefill
-        if generation_config.prefill_chunk_size is None:
-            model_inputs = self.prepare_inputs_for_generation(
-                input_ids,
-                next_sequence_length=next_sequence_length,
-                is_first_iteration=is_first_iteration,
-                **model_kwargs,
-            )
-            return self(**model_inputs, return_dict=True)
-
-        # Chunked prefill (for very large contexts)
-        else:
-            # Even if we are not compiling the forward, flex is always compiled when used. With chunked prefill, we may
-            # end up needing just a bit more graphs than the default (which is 8). Doing this avoids very cryptic warnings
-            getattr(torch, "_dynamo").config.cache_size_limit = 64
-
-            chunk_size = generation_config.prefill_chunk_size
-            input_chunks = torch.split(input_ids, chunk_size, dim=-1)
-
-            if "past_key_values" not in model_kwargs:
-                raise ValueError("Cannot use prefill chunking without a cache")
-
-            model_forward = (
-                self.get_compiled_call(generation_config.compile_config)
-                if self._valid_auto_compile_criteria(model_kwargs, generation_config)
-                else self.__call__
-            )
-
-            attention_mask = model_kwargs.pop("attention_mask", None)
-            position_ids = model_kwargs.pop("position_ids", None)
-            past_length = 0
-            for input_chunk in input_chunks:
-                current_length = past_length + input_chunk.shape[-1]
-                if attention_mask is not None:
-                    model_kwargs["attention_mask"] = attention_mask[:, :current_length]
-                if position_ids is not None:
-                    model_kwargs["position_ids"] = position_ids[:, past_length:current_length]
-                model_kwargs["hf_chunked_prefill"] = True
-                model_kwargs["prefill_final_chunk"] = current_length >= input_ids.shape[-1]
-                model_inputs = self.prepare_inputs_for_generation(input_chunk, **model_kwargs)
-
-                outputs = model_forward(**model_inputs, return_dict=True)
-
-                model_kwargs["past_key_values"] = outputs.past_key_values
-                past_length = current_length
-
-            # Recreate the kwargs based on the full length
-            model_kwargs["attention_mask"] = attention_mask
-            model_kwargs["position_ids"] = position_ids
-            model_kwargs.pop("hf_chunked_prefill", None)
-            model_kwargs.pop("prefill_final_chunk", None)
-
-            # Latest outputs contain next token logits
-            return outputs
+        return super().prepare_inputs_for_generation(*args, **kwargs)
 
 
 def left_pad_logical_positions(
     attention_mask: torch.Tensor,
-    past_seen=0,
 ) -> torch.Tensor:
     """
     Convert a left-padded 2D attention mask into logical text positions.
@@ -999,51 +850,7 @@ def left_pad_logical_positions(
     offset = seq_len - real_lens
     local = (col - offset).clamp(min=0) * mask.to(dtype=dtype)
 
-    if isinstance(past_seen, torch.Tensor):
-        past_seen = past_seen.to(device=device, dtype=dtype).reshape(-1)
-        if past_seen.shape[0] != batch:
-            raise ValueError(
-                f"past_seen batch {past_seen.shape[0]} != mask batch {batch}"
-            )
-        local = local + past_seen.unsqueeze(-1)
-    else:
-        local = local + past_seen
-
     return local
-
-
-def dense_kv_logical_positions(
-    kv_len: int,
-    q_len: int,
-    chunk_text_position_ids: torch.Tensor,
-    device: torch.device,
-    dtype: torch.dtype = torch.long,
-) -> torch.Tensor:
-    """Reconstruct dense ``[0..kv_len-1]`` logical positions from a final-chunk tail."""
-    tail = chunk_text_position_ids.to(device=device, dtype=dtype)
-    if tail.ndim == 3:
-        tail = tail[0]
-    tail = tail[:, -q_len:]
-    start = tail[:, :1] - (kv_len - q_len)
-    return start + torch.arange(kv_len, device=device, dtype=dtype).view(1, -1)
-
-
-def prefill_prompt_complete(
-    attention_mask: torch.Tensor,
-    past_len: int | torch.Tensor,
-    chunk_seq_len: int,
-) -> bool:
-    """
-    True when cumulative cached + current chunk covers all real (non-pad) prompt tokens.
-
-    Supports Contract B (real-token-only chunks) and Contract A (one-shot with pads in tensor).
-    """
-    target_len = attention_mask.sum(dim=-1)
-    if isinstance(past_len, torch.Tensor):
-        past_len = past_len.reshape(-1).to(device=attention_mask.device)
-        cumulative = past_len + chunk_seq_len
-        return bool((cumulative >= target_len).all())
-    return bool((past_len + chunk_seq_len) >= int(target_len.max()))
 
 
 def build_snapkv_kv_valid_mask(

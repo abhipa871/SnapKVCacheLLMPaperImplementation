@@ -2,7 +2,7 @@
 CPU: python -m pytest test_modify_qwen_snapkv.py -m "not gpu" -q
 GPU: python -m pytest test_modify_qwen_snapkv.py -m gpu -q
 
-SnapKV / padding / chunked-prefill tests for ``modify_qwen``.
+SnapKV / padding / one-shot-prefill tests for ``modify_qwen``.
 """
 
 import copy
@@ -23,10 +23,8 @@ from modify_qwen import (  # noqa: E402
     SnapKVQwen3_5ForCausalLM,
     SnapKVQwen3_5TextModel,
     build_snapkv_kv_valid_mask,
-    dense_kv_logical_positions,
     left_pad_logical_positions,
     make_snapkv_causal_mask,
-    prefill_prompt_complete,
 )
 
 
@@ -84,7 +82,6 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "gpu: CUDA + HF Qwen3.5-0.8B")
     config.addinivalue_line("markers", "padding: mask and logical position helpers")
     config.addinivalue_line("markers", "snapkv: SnapKVCache and attention mask paths")
-    config.addinivalue_line("markers", "chunk_prefill: multi-forward prefill / gate tests")
     config.addinivalue_line("markers", "integration: mini-model forwards")
 
 
@@ -143,85 +140,6 @@ def _snapkv_left_pad_attn_b2(seq: int = 30) -> torch.Tensor:
     return attn
 
 
-def _contract_b_chunk_columns(attn_mask: torch.Tensor, tokens_per_chunk: int) -> list[list[int]]:
-    """Column index lists per chunk (row-0 real columns; tests use aligned real spans)."""
-
-    cols = attn_mask[0].nonzero(as_tuple=True)[0].tolist()
-    return [cols[i : i + tokens_per_chunk] for i in range(0, len(cols), tokens_per_chunk)]
-
-
-def _contract_b_chunk_columns_for_row(
-    attn_mask: torch.Tensor,
-    row_idx: int,
-    tokens_per_chunk: int,
-) -> list[list[int]]:
-    """Column index lists per chunk using one batch row's real (non-pad) columns.
-
-    Chunks are rectangular across the batch: shorter rows may see pad/dummy columns in
-    a chunk (not true per-row Contract B). Use only when testing batch-level gates.
-    """
-
-    cols = attn_mask[row_idx].nonzero(as_tuple=True)[0].tolist()
-    return [cols[i : i + tokens_per_chunk] for i in range(0, len(cols), tokens_per_chunk)]
-
-
-def _run_chunked_prefill(
-    model: SnapKVQwen3_5TextModel,
-    input_ids_full: torch.Tensor,
-    attn_mask: torch.Tensor,
-    chunk_columns: list[list[int]],
-):
-    pst = None
-    out = None
-    for cols in chunk_columns:
-        chunk_ids = input_ids_full[:, cols]
-        out = model(
-            input_ids=chunk_ids,
-            attention_mask=attn_mask,
-            past_key_values=pst,
-            use_cache=True,
-        )
-        pst = out.past_key_values
-    return out
-
-
-def _run_hf_style_chunked_prefill(
-    model: SnapKVQwen3_5TextModel,
-    input_ids_full: torch.Tensor,
-    attention_mask_full: torch.Tensor,
-    chunk_size: int,
-):
-    """HF prefill_chunk_size emulation: prefix-sliced masks + explicit flags per chunk."""
-
-    pst = None
-    out = None
-    L = input_ids_full.shape[-1]
-
-    for start in range(0, L, chunk_size):
-        end = min(start + chunk_size, L)
-
-        chunk_ids = input_ids_full[:, start:end]
-        prefix_mask = attention_mask_full[:, :end]
-        final = end >= L
-
-        out = model(
-            input_ids=chunk_ids,
-            attention_mask=prefix_mask,
-            past_key_values=pst,
-            use_cache=True,
-            hf_chunked_prefill=True,
-            prefill_final_chunk=final,
-        )
-        pst = out.past_key_values
-
-        if not final:
-            assert not getattr(pst, "snap_prefill_complete", False)
-            sa = _first_snapkv_self_attn_from_text(model)
-            assert sa.snap_kv_cache.snap_score is None
-
-    return out
-
-
 def _first_snapkv_self_attn_layer(model):
     lm = model.model.language_model
     for lyr in lm.layers:
@@ -258,22 +176,6 @@ def test_left_pad_logical_positions_examples():
     assert got[0].tolist() == [0, 0, 0, 1, 2]
     assert got[1].tolist() == [0, 0, 1, 2, 3]
     assert got[2].tolist() == [0, 1, 2, 3, 4]
-
-
-@pytest.mark.padding
-def test_left_pad_logical_positions_past_seen_tensor():
-    mask = torch.tensor([[0, 0, 1, 1], [0, 1, 1, 1]], dtype=torch.bool)
-    past_seen = torch.tensor([10, 20], dtype=torch.long)
-    got = left_pad_logical_positions(mask, past_seen)
-    assert got[0].tolist() == [10, 10, 10, 11]
-    assert got[1].tolist() == [20, 20, 21, 22]
-
-
-@pytest.mark.padding
-def test_dense_kv_logical_positions_rebuilds_arange():
-    tail = torch.tensor([[2, 3]], dtype=torch.long)
-    got = dense_kv_logical_positions(4, 2, tail, device=torch.device("cpu"))
-    assert got[0].tolist() == [0, 1, 2, 3]
 
 
 @pytest.mark.padding
@@ -345,51 +247,7 @@ def test_causal_plus_padding_blocked():
 
 
 # ---------------------------------------------------------------------------
-# B. Prefill gate
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.chunk_prefill
-def test_prefill_prompt_complete_false_mid_chunk():
-    attn = torch.tensor([[0, 0, 1, 1, 1, 1]], dtype=torch.bool)
-    assert not prefill_prompt_complete(attn, past_len=0, chunk_seq_len=2)
-
-
-@pytest.mark.chunk_prefill
-def test_prefill_prompt_complete_true_final_chunk():
-    attn = torch.tensor([[0, 0, 1, 1, 1, 1]], dtype=torch.bool)
-    assert prefill_prompt_complete(attn, past_len=2, chunk_seq_len=2)
-
-
-@pytest.mark.chunk_prefill
-def test_prefill_prompt_complete_left_pad_uses_real_token_count():
-    attn = torch.tensor([[0, 0, 0, 1, 1, 1]], dtype=torch.bool)
-    assert not prefill_prompt_complete(attn, past_len=0, chunk_seq_len=2)
-    assert prefill_prompt_complete(attn, past_len=1, chunk_seq_len=2)
-
-
-@pytest.mark.chunk_prefill
-def test_prefill_prompt_complete_heterogeneous_waits_for_longest_row():
-    """Batch gate uses ``.all()``: shorter rows finishing early must not mark prefill complete."""
-
-    attn = torch.zeros(2, 10, dtype=torch.bool)
-    attn[0, 4:] = True  # 6 real tokens
-    attn[1, 3:] = True  # 7 real tokens (longest row)
-
-    assert int(attn.sum(dim=-1)[0]) == 6
-    assert int(attn.sum(dim=-1)[1]) == 7
-
-    # Two chunks of 3: cumulative 6 covers row 0 but not row 1.
-    assert not prefill_prompt_complete(attn, past_len=3, chunk_seq_len=3)
-    assert prefill_prompt_complete(attn[0:1], past_len=3, chunk_seq_len=3)
-    assert not prefill_prompt_complete(attn[1:2], past_len=3, chunk_seq_len=3)
-
-    # One more real token in the final chunk completes the longest row (and batch).
-    assert prefill_prompt_complete(attn, past_len=6, chunk_seq_len=1)
-
-
-# ---------------------------------------------------------------------------
-# C. SnapKVCache unit
+# B. SnapKVCache unit
 # ---------------------------------------------------------------------------
 
 
@@ -438,25 +296,6 @@ def test_snapkv_append_positions_left_pad_contract_a():
     cache._append_positions(weights, padding_attention_mask=attn)
     assert cache.position_ids is not None
     assert cache.position_ids[0, 0].tolist() == expected[0].tolist()
-
-
-@pytest.mark.snapkv
-def test_snapkv_append_positions_dense_chunk_contract_b():
-    B, nk, kv_len, q_len, win, nh = 1, 2, 4, 2, 2, 4
-    cache = SnapKVCache(
-        window_size=win,
-        max_capacity_prompt=8,
-        layer_idx=0,
-        num_attention_heads=nh,
-        num_key_value_heads=nk,
-        num_key_value_groups=nh // nk,
-    )
-    weights = torch.ones(B, nh, q_len, kv_len)
-    cache._update_snap_score(weights)
-    chunk_pos = torch.tensor([[2, 3]], dtype=torch.long)
-    cache._append_positions(weights, text_position_ids=chunk_pos)
-    want = dense_kv_logical_positions(kv_len, q_len, chunk_pos, device=weights.device)
-    assert cache.position_ids[0, 0].tolist() == want[0].tolist()
 
 
 @pytest.mark.snapkv
@@ -744,245 +583,7 @@ def test_eager_attn_matches_scaled_softmax(qwen_cfg):
 
 
 # ---------------------------------------------------------------------------
-# E/F. Chunked prefill integration
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.chunk_prefill
-@pytest.mark.integration
-def test_chunked_intermediate_forward_no_snap_compress(mini_text_model):
-    B, L = 1, 6
-    attn = torch.zeros(B, L, dtype=torch.bool)
-    attn[:, 2:] = True
-    full_ids = torch.arange(10, 10 + L).view(1, -1)
-    chunks = _contract_b_chunk_columns(attn, tokens_per_chunk=2)
-    out1 = mini_text_model(
-        input_ids=full_ids[:, chunks[0]],
-        attention_mask=attn,
-        use_cache=True,
-    )
-    pst = out1.past_key_values
-    assert pst is not None
-    assert not getattr(pst, "snap_prefill_complete", False)
-    assert pst.get_seq_length() == 2
-    sa = _first_snapkv_self_attn_from_text(mini_text_model)
-    assert sa.snap_kv_cache.snap_score is None
-
-
-@pytest.mark.chunk_prefill
-@pytest.mark.integration
-def test_chunked_final_forward_triggers_snap():
-    model = SnapKVQwen3_5TextModel(_mini_snap_cfg(window_size=2, max_capacity_prompt=4)).eval()
-    torch.manual_seed(1)
-    for p in model.parameters():
-        if p.dim() > 1:
-            torch.nn.init.normal_(p, 0.02)
-    B, L = 1, 8
-    attn = torch.ones(B, L, dtype=torch.bool)
-    full_ids = torch.arange(20, 20 + L).view(1, -1)
-    chunks = _contract_b_chunk_columns(attn, tokens_per_chunk=2)
-    out = _run_chunked_prefill(model, full_ids, attn, chunks)
-    pst = out.past_key_values
-    assert getattr(pst, "snap_prefill_complete", False)
-    sa = _first_snapkv_self_attn_from_text(model)
-    assert sa.snap_kv_cache.snap_score is not None
-    cap = sa.snap_kv_cache.max_capacity_prompt
-    li = sa.layer_idx
-    assert pst.layers[li].keys.shape[2] <= cap
-
-
-@pytest.mark.chunk_prefill
-@pytest.mark.integration
-def test_chunked_left_pad_dense_kv_positions(mini_text_model):
-    B, L = 1, 6
-    attn = torch.zeros(B, L, dtype=torch.bool)
-    attn[:, 2:] = True
-    full_ids = torch.arange(30, 30 + L).view(1, -1)
-    chunks = _contract_b_chunk_columns(attn, tokens_per_chunk=2)
-    out = _run_chunked_prefill(mini_text_model, full_ids, attn, chunks)
-    sa = _first_snapkv_self_attn_from_text(mini_text_model)
-    pid = sa.snap_kv_cache.position_ids
-    assert pid is not None
-    real_count = int(attn.sum().item())
-    assert pid.shape[-1] <= sa.snap_kv_cache.max_capacity_prompt
-    assert pid[0, 0].max().item() == real_count - 1
-
-
-@pytest.mark.chunk_prefill
-@pytest.mark.snapkv
-@pytest.mark.integration
-def test_chunked_left_pad_snapkv_keeps_only_valid_prefix_slots():
-    """Homogeneous left-pad batch: both rows share the same real-token count and chunk geometry."""
-
-    model = SnapKVQwen3_5TextModel(_mini_snap_cfg(window_size=2, max_capacity_prompt=4)).eval()
-    torch.manual_seed(2)
-    for p in model.parameters():
-        if p.dim() > 1:
-            torch.nn.init.normal_(p, 0.02)
-    B, L = 2, 10
-    attn = torch.zeros(B, L, dtype=torch.bool)
-    attn[0, 4:] = True
-    attn[1, 4:] = True
-    full_ids = torch.stack(
-        [
-            torch.arange(10, 10 + L),
-            torch.arange(20, 20 + L),
-        ]
-    )
-    chunks = _contract_b_chunk_columns(attn, tokens_per_chunk=3)
-    out = _run_chunked_prefill(model, full_ids, attn, chunks)
-    sa = _first_snapkv_self_attn_from_text(model)
-    li = sa.layer_idx
-    k = out.past_key_values.layers[li].keys
-    assert k is not None
-    assert k.shape[2] <= sa.snap_kv_cache.max_capacity_prompt
-
-
-@pytest.mark.chunk_prefill
-@pytest.mark.snapkv
-@pytest.mark.integration
-def test_chunked_heterogeneous_left_pad_snapkv_deferred_until_longest_row():
-    """Deferred batch-level SnapKV gating for heterogeneous left-pad prefill.
-
-    Chunks follow the longest row (``row_idx=1``), so the first chunk includes column 3,
-    which is padding for row 0. This does **not** prove per-row Contract B (real-token-only
-    chunks for every row); it only proves SnapKV stays off until ``prefill_prompt_complete``
-    sees all rows done under the batch-level ``.all()`` gate.
-    """
-
-    model = SnapKVQwen3_5TextModel(_mini_snap_cfg(window_size=2, max_capacity_prompt=16)).eval()
-    torch.manual_seed(3)
-    for p in model.parameters():
-        if p.dim() > 1:
-            torch.nn.init.normal_(p, 0.02)
-
-    B, L = 2, 10
-    attn = torch.zeros(B, L, dtype=torch.bool)
-    attn[0, 4:] = True  # 6 real tokens
-    attn[1, 3:] = True  # 7 real tokens (longest)
-    full_ids = torch.stack(
-        [
-            torch.arange(10, 10 + L),
-            torch.arange(20, 20 + L),
-        ]
-    )
-    chunks = _contract_b_chunk_columns_for_row(attn, row_idx=1, tokens_per_chunk=3)
-    assert chunks == [[3, 4, 5], [6, 7, 8], [9]]
-
-    out_mid = _run_chunked_prefill(model, full_ids, attn, chunks[:2])
-    pst_mid = out_mid.past_key_values
-    sa = _first_snapkv_self_attn_from_text(model)
-
-    assert pst_mid.get_seq_length() == 6
-    assert not prefill_prompt_complete(attn, past_len=3, chunk_seq_len=3)
-    assert not getattr(pst_mid, "snap_prefill_complete", False)
-    assert not getattr(pst_mid, "last_chunk_processed", False)
-    assert sa.snap_kv_cache.snap_score is None
-
-    out_final = model(
-        input_ids=full_ids[:, chunks[2]],
-        attention_mask=attn,
-        past_key_values=pst_mid,
-        use_cache=True,
-    )
-    pst_final = out_final.past_key_values
-
-    assert prefill_prompt_complete(attn, past_len=6, chunk_seq_len=1)
-    assert getattr(pst_final, "snap_prefill_complete", False)
-    assert sa.snap_kv_cache.snap_score is not None
-
-
-@pytest.mark.chunk_prefill
-def test_prepare_inputs_for_generation_preserves_hf_prefill_flags(qwen_cfg):
-    cfg = _patch_snapkv_budget(qwen_cfg, max_capacity_prompt=16, window_size=8)
-    model = SnapKVQwen3_5ForCausalLM(cfg).eval()
-
-    input_ids = torch.ones(1, 2, dtype=torch.long)
-    attention_mask = torch.ones(1, 2, dtype=torch.long)
-
-    model_inputs = model.prepare_inputs_for_generation(
-        input_ids,
-        attention_mask=attention_mask,
-        use_cache=True,
-        hf_chunked_prefill=True,
-        prefill_final_chunk=False,
-    )
-
-    assert model_inputs["hf_chunked_prefill"] is True
-    assert model_inputs["prefill_final_chunk"] is False
-
-
-@pytest.mark.chunk_prefill
-@pytest.mark.integration
-def test_hf_style_prefill_chunk_size_prefix_sliced_mask_triggers_snap_on_final():
-    """HF prefill_chunk_size: prefix-sliced masks defer SnapKV to the final chunk flag."""
-
-    model = SnapKVQwen3_5TextModel(
-        _mini_snap_cfg(window_size=2, max_capacity_prompt=4)
-    ).eval()
-
-    torch.manual_seed(4)
-    for p in model.parameters():
-        if p.dim() > 1:
-            torch.nn.init.normal_(p, 0.02)
-
-    B, L = 1, 8
-    input_ids = torch.arange(10, 10 + L).view(1, -1)
-    attention_mask = torch.ones(B, L, dtype=torch.bool)
-
-    out = _run_hf_style_chunked_prefill(
-        model,
-        input_ids,
-        attention_mask,
-        chunk_size=2,
-    )
-
-    pst = out.past_key_values
-    assert getattr(pst, "snap_prefill_complete", False)
-
-    sa = _first_snapkv_self_attn_from_text(model)
-    assert sa.snap_kv_cache.snap_score is not None
-
-    li = sa.layer_idx
-    assert pst.layers[li].keys.shape[2] <= sa.snap_kv_cache.max_capacity_prompt
-
-
-@pytest.mark.chunk_prefill
-@pytest.mark.integration
-def test_hf_style_prefix_sliced_mask_does_not_infer_final_without_flag():
-    """First HF chunk (prefix mask width == chunk length) must not trigger SnapKV."""
-
-    model = SnapKVQwen3_5TextModel(
-        _mini_snap_cfg(window_size=2, max_capacity_prompt=4)
-    ).eval()
-
-    torch.manual_seed(5)
-    for p in model.parameters():
-        if p.dim() > 1:
-            torch.nn.init.normal_(p, 0.02)
-
-    B, L = 1, 8
-    input_ids = torch.arange(30, 30 + L).view(1, -1)
-    attention_mask = torch.ones(B, L, dtype=torch.bool)
-
-    # Old code incorrectly treated this as final because sum(mask) == chunk length.
-    out = model(
-        input_ids=input_ids[:, :2],
-        attention_mask=attention_mask[:, :2],
-        use_cache=True,
-        hf_chunked_prefill=True,
-        prefill_final_chunk=False,
-    )
-
-    pst = out.past_key_values
-    assert not getattr(pst, "snap_prefill_complete", False)
-
-    sa = _first_snapkv_self_attn_from_text(model)
-    assert sa.snap_kv_cache.snap_score is None
-
-
-# ---------------------------------------------------------------------------
-# G. GPU HF tests
+# E. GPU HF tests
 # ---------------------------------------------------------------------------
 
 
@@ -1129,44 +730,3 @@ def test_gpu_greedy_padded_decode_position_ids_stable(qwen_cfg):
             pst = out.past_key_values
             verify(pst, attn, f"decode_{step}")
 
-
-@pytest.mark.gpu
-@pytest.mark.chunk_prefill
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
-def test_gpu_chunked_prefill_snapkv_dynamic_cache(qwen_cfg):
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", trust_remote_code=True)
-    tok.padding_side = "left"
-    cfg = _patch_snapkv_budget(qwen_cfg, max_capacity_prompt=32, window_size=8)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    model = SnapKVQwen3_5ForCausalLM.from_pretrained(
-        "Qwen/Qwen3.5-0.8B",
-        config=cfg,
-        torch_dtype=dtype,
-        device_map="cuda:0",
-        trust_remote_code=True,
-        attn_implementation="eager",
-    ).eval()
-    text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
-    batch = tok(text, return_tensors="pt").to("cuda")
-    attn = batch["attention_mask"].bool()
-    cols = attn[0].nonzero(as_tuple=True)[0].tolist()
-    mid = len(cols) // 2
-    chunk_cols = [cols[:mid], cols[mid:]]
-    model.reset_snapkv_state()
-    pst = None
-    with torch.inference_mode():
-        for i, cc in enumerate(chunk_cols):
-            chunk = {k: v for k, v in batch.items()}
-            chunk["input_ids"] = batch["input_ids"][:, cc]
-            out = model(**chunk, past_key_values=pst, use_cache=True, return_dict=True)
-            pst = out.past_key_values
-            if i == 0:
-                assert not getattr(pst, "snap_prefill_complete", False)
-            else:
-                assert getattr(pst, "snap_prefill_complete", False)
-    sa = _first_snapkv_self_attn_layer(model).self_attn
-    cap = sa.snap_kv_cache.max_capacity_prompt
-    li = sa.layer_idx
-    assert pst.layers[li].keys.shape[2] <= cap
